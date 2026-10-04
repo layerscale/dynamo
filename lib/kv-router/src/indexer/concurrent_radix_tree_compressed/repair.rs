@@ -24,55 +24,86 @@ impl ConcurrentRadixTreeCompressed {
         None
     }
 
+    /// The node a worker's lookup names for `hash`, without validating it. The
+    /// entry can be stale after a cross-thread split; callers detect that in
+    /// their own locked operation on the node and call `repair_stale`.
+    pub(super) fn lookup_node(
+        lookup: &FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        worker: WorkerWithDpRank,
+        hash: ExternalSequenceBlockHash,
+    ) -> Option<SharedNode> {
+        lookup.get(&worker)?.get(&hash).cloned()
+    }
+
+    /// Resolve `hash`, which a locked operation found missing from `stale`, to the
+    /// descendant a cross-thread split moved it to, and repair the lookup range
+    /// that `direction` will use.
+    pub(super) fn repair_stale(
+        &self,
+        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        table: &SlotTable,
+        stale: &SharedNode,
+        hash: ExternalSequenceBlockHash,
+        direction: LookupRepairDirection,
+    ) -> Option<SharedNode> {
+        let resolved = Self::find_in_subtree(stale, hash)?;
+        #[cfg(any(test, feature = "bench"))]
+        self.bench_metrics
+            .lookup_repair_scans
+            .fetch_add(1, Ordering::Relaxed);
+        self.repair_lookup_for_resolved_node(lookup, table, hash, stale, &resolved, direction);
+        Some(resolved)
+    }
+
     /// Look up `hash` in a worker's lookup, resolving stale entries caused by
     /// cross-thread splits. Returns the `SharedNode` whose edge contains `hash`.
     pub(super) fn resolve_lookup(
         &self,
         lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
-        worker: WorkerWithDpRank,
+        worker: EventWorker<'_>,
         hash: ExternalSequenceBlockHash,
         direction: LookupRepairDirection,
     ) -> Option<SharedNode> {
-        let node = lookup.get(&worker)?.get(&hash)?.clone();
-
-        // Fast path: hash is still in this node's edge_index.
+        let node = Self::lookup_node(lookup, worker.rank, hash)?;
         if node.contains_edge_hash(hash) {
             return Some(node);
         }
-
-        // Slow path: hash was moved to a descendant by a cross-thread split.
-        let resolved = Self::find_in_subtree(&node, hash)?;
-        #[cfg(feature = "bench")]
-        self.bench_metrics
-            .lookup_repair_scans
-            .fetch_add(1, Ordering::Relaxed);
-        self.repair_lookup_for_resolved_node(lookup, hash, &resolved, direction);
-        Some(resolved)
+        self.repair_stale(lookup, worker.table, &node, hash, direction)
     }
 
+    /// Repoints this lane's entries that still name `stale` at `resolved`, over the range
+    /// of `resolved`'s edge each rank covers on the side of `hash` that `direction` picks.
+    /// Entries naming any other node are left to their own lazy repair, so an entry never
+    /// moves onto a node only because a recycled slot inherited stale bits there.
     pub(super) fn repair_lookup_for_resolved_node(
         &self,
         lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        table: &SlotTable,
         hash: ExternalSequenceBlockHash,
+        stale: &SharedNode,
         resolved: &SharedNode,
         direction: LookupRepairDirection,
     ) {
-        #[cfg(feature = "bench")]
+        #[cfg(any(test, feature = "bench"))]
         let mut changed_entries_total = 0u64;
 
         for (&worker, worker_lookup) in lookup.iter_mut() {
-            let _changed_entries = update_existing_arc_lookup_for_keys(
-                worker_lookup,
-                resolved.lookup_hashes_for_worker_repair(worker, hash, direction),
+            let Some(slot) = table.slot_of(worker) else {
+                continue;
+            };
+            let _changed_entries = worker_lookup.redirect(
+                resolved.lookup_hashes_for_slot_repair(slot, hash, direction),
+                stale,
                 resolved,
+                Arc::ptr_eq,
             );
-            #[cfg(feature = "bench")]
+            #[cfg(any(test, feature = "bench"))]
             {
                 changed_entries_total += _changed_entries as u64;
             }
         }
 
-        #[cfg(feature = "bench")]
+        #[cfg(any(test, feature = "bench"))]
         self.bench_metrics
             .lookup_repair_entries
             .fetch_add(changed_entries_total, Ordering::Relaxed);

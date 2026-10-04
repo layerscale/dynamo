@@ -8,10 +8,11 @@
 
 use std::sync::Arc;
 
+use crossbeam_epoch::Guard;
 use dashmap::DashMap;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::collections::VecDeque;
-#[cfg(feature = "bench")]
+#[cfg(any(test, feature = "bench"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
@@ -19,12 +20,15 @@ use super::{
     MatchDetails, PreBoundEventCounters, SyncIndexer, WorkerLookupStats, WorkerTask,
 };
 use crate::cleanup::{CleanupGuard, CleanupState};
-use crate::lookup_update::{update_arc_lookup_for_keys, update_existing_arc_lookup_for_keys};
 use crate::protocols::*;
 
+mod block_lookup;
 mod children;
+mod coverage;
 mod node;
+mod state;
 mod types;
+use coverage::{Slot, SlotRegistry, SlotSet, SlotTable, wait_for_pinned_threads};
 use node::*;
 use types::*;
 
@@ -44,20 +48,22 @@ pub struct ConcurrentRadixTreeCompressed {
     root: SharedNode,
 
     anchor_nodes: DashMap<ExternalSequenceBlockHash, SharedNode, FxBuildHasher>,
+    /// Dense slots of the ranks with coverage in this tree.
+    slots: SlotRegistry,
     cleanup: CleanupState,
     lifecycle: super::HashLifecycle,
-    #[cfg(feature = "bench")]
+    #[cfg(any(test, feature = "bench"))]
     bench_metrics: CrtcBenchMetrics,
 }
 
-#[cfg(feature = "bench")]
+#[cfg(any(test, feature = "bench"))]
 struct CrtcBenchMetrics {
     node_splits: AtomicU64,
     lookup_repair_scans: AtomicU64,
     lookup_repair_entries: AtomicU64,
 }
 
-#[cfg(feature = "bench")]
+#[cfg(any(test, feature = "bench"))]
 impl CrtcBenchMetrics {
     fn new() -> Self {
         Self {
@@ -90,6 +96,10 @@ impl Drop for ConcurrentRadixTreeCompressed {
         while let Some(node) = stack.pop() {
             stack.extend(node.take_children());
         }
+        // Unlinked child snapshots own the detached nodes until epoch reclamation;
+        // hand them to the collector now and free whatever has already expired.
+        children::NodeChildren::flush_retired();
+        children::NodeChildren::drain_graveyard(usize::MAX);
     }
 }
 
@@ -115,9 +125,10 @@ impl ConcurrentRadixTreeCompressed {
         Self {
             root: Arc::new(Node::new()),
             anchor_nodes: DashMap::with_hasher(FxBuildHasher),
+            slots: SlotRegistry::default(),
             cleanup: CleanupState::new(),
             lifecycle: super::HashLifecycle::default(),
-            #[cfg(feature = "bench")]
+            #[cfg(any(test, feature = "bench"))]
             bench_metrics: CrtcBenchMetrics::new(),
         }
     }
@@ -180,22 +191,54 @@ impl ConcurrentRadixTreeCompressed {
         children
     }
 
+    /// The slot `worker` is currently mapped to, if any.
+    #[cfg(test)]
+    fn slot_for_test(&self, worker: WorkerWithDpRank) -> Option<coverage::Slot> {
+        self.slots.table(&crossbeam_epoch::pin()).slot_of(worker)
+    }
+
+    /// Resolves `worker`'s slot as an event would, allocating one if needed.
+    #[cfg(test)]
+    fn event_worker_for_test<'g>(
+        &self,
+        worker: WorkerWithDpRank,
+        guard: &'g Guard,
+    ) -> EventWorker<'g> {
+        EventWorker {
+            rank: worker,
+            slot: self.slots.acquire(worker, guard).unwrap(),
+            table: self.slots.table(guard),
+        }
+    }
+
     fn resolve_anchor_lookup(
         &self,
         lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
-        worker: WorkerWithDpRank,
+        worker: EventWorker<'_>,
         hash: ExternalSequenceBlockHash,
     ) -> Option<SharedNode> {
         let node = self.anchor_nodes.get(&hash)?.clone();
-        node.promote_worker_to_full_edge(worker);
-        lookup.entry(worker).or_default().insert(hash, node.clone());
+        node.promote_slot_to_full_edge(worker.slot);
+        lookup
+            .entry(worker.rank)
+            .or_default()
+            .insert(hash, node.clone());
         Some(node)
     }
 
+    /// Whether `node`, whose edge contains `hash`, is the branch anchor for `hash`.
+    ///
+    /// The node flag is exact: anchors are created only by `apply_anchor`, stay in
+    /// `anchor_nodes` until the tree is dropped, and keep their one-block edge, so an
+    /// anchor containing `hash` is the map entry for `hash`.
     fn is_anchor_node(&self, hash: ExternalSequenceBlockHash, node: &SharedNode) -> bool {
-        self.anchor_nodes
-            .get(&hash)
-            .is_some_and(|anchor| Arc::ptr_eq(anchor.value(), node))
+        debug_assert_eq!(
+            node.is_anchor(),
+            self.anchor_nodes
+                .get(&hash)
+                .is_some_and(|anchor| Arc::ptr_eq(anchor.value(), node)),
+        );
+        node.is_anchor()
     }
 
     // ------------------------------------------------------------------
@@ -204,22 +247,35 @@ impl ConcurrentRadixTreeCompressed {
 
     /// Apply deferred lookup updates after `Node::split_at`.
     ///
-    /// Updates worker lookup maps so entries for blocks that moved to the suffix now
-    /// point to the suffix node. Must be called **after** the write guard is dropped.
+    /// Repoints this lane's entries for blocks that moved from `prefix` to the suffix,
+    /// for every rank the suffix credits with them. Must be called **after** the write
+    /// guard is dropped.
+    ///
+    /// Only entries that still name `prefix` move. An entry naming another node is left
+    /// to lazy repair; this way an entry never moves onto a node only because a slot's
+    /// bits there are stale, which a recycled slot can inherit on an unlinked subtree.
     fn apply_split_lookup(
         &self,
         lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        table: &SlotTable,
+        prefix: &SharedNode,
         split: SplitLookupData,
     ) {
-        #[cfg(feature = "bench")]
+        #[cfg(any(test, feature = "bench"))]
         self.bench_metrics
             .node_splits
             .fetch_add(1, Ordering::Relaxed);
-        for (worker, hashes) in split.suffix.lookup_entries_by_worker() {
-            if let Some(wl) = lookup.get_mut(&worker) {
-                for hash in hashes {
-                    wl.insert(hash, split.suffix.clone());
-                }
+        let (hashes, cutoffs) = split
+            .suffix
+            .covered_prefixes(lookup.keys().map(|&worker| table.slot_of(worker)));
+        for (wl, cutoff) in lookup.values_mut().zip(cutoffs) {
+            if cutoff > 0 {
+                wl.redirect(
+                    hashes[..cutoff].iter().copied(),
+                    prefix,
+                    &split.suffix,
+                    Arc::ptr_eq,
+                );
             }
         }
     }
@@ -231,10 +287,10 @@ impl ConcurrentRadixTreeCompressed {
         blocks: &[KvCacheStoredBlockData],
         node: &SharedNode,
     ) -> bool {
-        let changed = update_arc_lookup_for_keys(
-            worker_lookup,
+        let changed = worker_lookup.upsert_all(
             blocks.iter().map(|block| block.block_hash),
             node,
+            Arc::ptr_eq,
         ) > 0;
         if self.lifecycle.is_enabled() {
             for block in blocks {
@@ -259,11 +315,21 @@ impl ConcurrentRadixTreeCompressed {
         let (id, op) = (kv_event.event_id, kv_event.data);
         let worker = WorkerWithDpRank::new(worker_id, kv_event.dp_rank);
 
+        // One pin per store or remove: child-map loads and publications nest inside it,
+        // and it keeps the rank's slot from being released mid-event. A clear walks the
+        // whole tree and repins every few nodes instead, so it cannot hold back epoch
+        // reclamation for the length of the walk.
         match op {
-            KvCacheEventData::Stored(op) => self.apply_stored(lookup, worker, op, id, counters),
-            KvCacheEventData::Removed(op) => self.apply_removed(lookup, worker, op, id),
+            KvCacheEventData::Stored(op) => {
+                let guard = crossbeam_epoch::pin();
+                self.apply_stored(lookup, worker, op, id, counters, &guard)
+            }
+            KvCacheEventData::Removed(op) => {
+                let guard = crossbeam_epoch::pin();
+                self.apply_removed(lookup, worker, op, id, &guard)
+            }
             KvCacheEventData::Cleared => {
-                self.erase_worker_coverage(lookup, WorkerRemovalTarget::DpRank(worker), true);
+                self.clear_worker_coverage(lookup, worker);
                 Ok(())
             }
         }

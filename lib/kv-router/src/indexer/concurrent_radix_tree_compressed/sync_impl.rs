@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::children::{LookupPin, NodeChildren};
 use super::*;
 #[cfg(feature = "bench")]
 use crate::indexer::WorkerObservationState;
@@ -9,6 +10,10 @@ use crate::indexer::{AnchorCapableSyncIndexer, ApproximateLruLane, ApproximateLr
 // ============================================================================
 // SyncIndexer implementation for ConcurrentRadixTreeCompressed
 // ============================================================================
+
+/// Epoch garbage a busy event lane frees between tasks, bounding the time it spends away
+/// from events while keeping the graveyard from growing under sustained load.
+const GRAVEYARD_NODES_PER_TASK: usize = 256;
 
 impl SyncIndexer for ConcurrentRadixTreeCompressed {
     #[cfg_attr(feature = "profile", inline(never))]
@@ -23,7 +28,18 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
         #[cfg(feature = "bench")]
         let mut observation = WorkerObservationState::default();
 
-        while let Ok(task) = event_receiver.recv() {
+        loop {
+            if event_receiver.is_empty() {
+                // Going idle: hand off this thread's retired child snapshots and free any
+                // expired epoch garbage before blocking.
+                NodeChildren::flush_retired();
+                NodeChildren::drain_graveyard(usize::MAX);
+            } else {
+                NodeChildren::drain_graveyard(GRAVEYARD_NODES_PER_TASK);
+            }
+            let Ok(task) = event_receiver.recv() else {
+                break;
+            };
             match task {
                 WorkerTask::Event(event) => {
                     let kind = EventKind::of(&event.event.data);
@@ -120,7 +136,7 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
                     resp,
                 } => {
                     approximate_lru.forget_worker(worker_id);
-                    self.erase_worker_coverage(
+                    self.remove_worker_coverage(
                         &mut lookup,
                         WorkerRemovalTarget::WorkerId(worker_id),
                         sweep_tree,
@@ -133,7 +149,7 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
                     sweep_tree,
                 } => {
                     approximate_lru.forget_rank(WorkerWithDpRank::new(worker_id, dp_rank));
-                    self.erase_worker_coverage(
+                    self.remove_worker_coverage(
                         &mut lookup,
                         WorkerRemovalTarget::DpRank(WorkerWithDpRank::new(worker_id, dp_rank)),
                         sweep_tree,
@@ -164,6 +180,9 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
                     let _ = resp.send(resident);
                 }
                 WorkerTask::Flush(sender) => {
+                    // Hand off retired child snapshots so their memory is reclaimed promptly.
+                    NodeChildren::flush_retired();
+                    NodeChildren::drain_graveyard(usize::MAX);
                     let _ = sender.send(());
                 }
                 WorkerTask::Terminate => {
@@ -198,7 +217,9 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
             entry.clone()
         };
 
-        anchor_node.promote_worker_to_full_edge(worker);
+        let guard = crossbeam_epoch::pin();
+        let slot = self.slots.acquire(worker, &guard)?;
+        anchor_node.promote_slot_to_full_edge(slot);
         Ok(())
     }
 
@@ -214,25 +235,30 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
         else {
             return Ok(OverlapScores::new());
         };
+        // The anchor map's `Arc` keeps the first node alive; children are borrowed
+        // under the walk's pin.
+        let guard = LookupPin::new();
         let details = if suffix.len() <= MAX_NO_COPY_ANCHORED_SUFFIX_BLOCKS {
             self.find_details_from_seq(
-                Some(anchor_node),
+                Some(&anchor_node),
                 AnchoredHashSequence {
                     head: anchor.anchor_local_hash,
                     tail: suffix,
                 },
                 false,
                 false,
+                &guard,
             )
         } else {
             let mut sequence = Vec::with_capacity(suffix.len() + 1);
             sequence.push(anchor.anchor_local_hash);
             sequence.extend_from_slice(suffix);
             self.find_details_from_seq(
-                Some(anchor_node),
+                Some(&anchor_node),
                 SliceHashSequence(&sequence),
                 false,
                 false,
+                &guard,
             )
         };
         let mut scores = details.overlap_scores;

@@ -1,15 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use arc_swap::ArcSwap;
+use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned, Shared};
+use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
+use super::node::Node;
 use super::types::SharedNode;
 use crate::protocols::LocalBlockHash;
 
@@ -30,13 +34,148 @@ enum ChildrenState {
     Sharded(ShardedChildren),
 }
 
+impl ChildrenState {
+    /// Entries of a compact snapshot. A sharded map is mutated in place and never
+    /// retired, so it reports none.
+    fn compact_entries(&self) -> &[ChildEntry] {
+        match self {
+            ChildrenState::Empty | ChildrenState::Sharded(_) => &[],
+            ChildrenState::Singleton(entry) => std::slice::from_ref(entry),
+            ChildrenState::Small(entries) => entries,
+        }
+    }
+
+    fn into_child_arcs(self) -> Vec<SharedNode> {
+        match self {
+            ChildrenState::Empty => Vec::new(),
+            ChildrenState::Singleton(entry) => vec![entry.node],
+            ChildrenState::Small(entries) => entries
+                .into_vec()
+                .into_iter()
+                .map(|entry| entry.node)
+                .collect(),
+            ChildrenState::Sharded(children) => {
+                children.into_iter().map(|(_, child)| child).collect()
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Retired child snapshots and unlinked child `Arc`s whose epoch grace period ended
+    /// during this thread's collections.
+    ///
+    /// Deferred destructors run on whichever thread collects, often a lookup, so they only
+    /// bury their garbage here. The thread frees it in small budgets after each lookup
+    /// ([`LookupPin`]) or event, so no single call frees a whole detached subtree and no
+    /// queue is shared on the hot path.
+    static LOCAL_GRAVEYARD: LocalGraveyard = const { LocalGraveyard(RefCell::new(Vec::new())) };
+}
+
+struct LocalGraveyard(RefCell<Vec<Grave>>);
+
+impl Drop for LocalGraveyard {
+    /// An exiting thread hands its garbage to the lanes, which free it iteratively and
+    /// release the retired-snapshot counts it holds.
+    fn drop(&mut self) {
+        for grave in self.0.get_mut().drain(..) {
+            SHARED_GRAVEYARD.push(grave);
+        }
+    }
+}
+
+/// Garbage a thread could not keep: overflow past [`LOCAL_GRAVEYARD_CAP`], and garbage
+/// buried while the thread exits. Event lanes drain it.
+static SHARED_GRAVEYARD: SegQueue<Grave> = SegQueue::new();
+
+const LOCAL_GRAVEYARD_CAP: usize = 4096;
+
+/// Graveyard work a lookup does after unpinning: graves opened plus nodes freed.
+const LOOKUP_GRAVEYARD_BUDGET: usize = 32;
+
+fn bury(grave: Grave) {
+    let mut grave = Some(grave);
+    let _ = LOCAL_GRAVEYARD.try_with(|local| {
+        if let Ok(mut local) = local.0.try_borrow_mut()
+            && local.len() < LOCAL_GRAVEYARD_CAP
+        {
+            local.extend(grave.take());
+        }
+    });
+    if let Some(grave) = grave {
+        SHARED_GRAVEYARD.push(grave);
+    }
+}
+
+fn unbury(include_shared: bool) -> Option<Grave> {
+    LOCAL_GRAVEYARD
+        .try_with(|local| {
+            local
+                .0
+                .try_borrow_mut()
+                .ok()
+                .and_then(|mut local| local.pop())
+        })
+        .ok()
+        .flatten()
+        .or_else(|| include_shared.then(|| SHARED_GRAVEYARD.pop()).flatten())
+}
+
+/// A lookup's epoch pin. Dropping it unpins, then pays down a little of this thread's
+/// graveyard, so collections that lookups trigger are freed a bounded amount at a time.
+pub(super) struct LookupPin(Option<Guard>);
+
+impl LookupPin {
+    pub(super) fn new() -> Self {
+        Self(Some(epoch::pin()))
+    }
+}
+
+impl std::ops::Deref for LookupPin {
+    type Target = Guard;
+
+    fn deref(&self) -> &Guard {
+        self.0.as_ref().expect("pinned until drop")
+    }
+}
+
+impl Drop for LookupPin {
+    fn drop(&mut self) {
+        drop(self.0.take());
+        NodeChildren::drain_graveyard_with(LOOKUP_GRAVEYARD_BUDGET, false);
+    }
+}
+
+enum Grave {
+    /// A retired compact snapshot; its children still count it in
+    /// `retired_snapshot_refs` until it is freed.
+    Snapshot(Box<ChildrenState>),
+    Nodes(Vec<SharedNode>),
+}
+
 pub(super) enum ChildInsertResult {
     Existing(SharedNode),
     Inserted(SharedNode),
 }
 
+/// Child map published as immutable compact snapshots, promoted to a `DashMap` past
+/// [`SMALL_CHILD_LIMIT`] children.
+///
+/// Snapshots are reclaimed through epochs: readers pin, load the current snapshot, and
+/// read it in place; writers swap in a successor and retire the predecessor once every
+/// pinned reader has moved on. Unlike a debt-based `ArcSwap`, a store does not walk
+/// every thread's reader slots, so its cost does not grow with the thread count.
+///
+/// Reclamation invariant: every child `Arc` owned by a map is released through the
+/// epoch while the map is reachable. A compact snapshot is retired whole, a sharded map
+/// defers each `Arc` it unlinks in place, and a split moves the published state to the
+/// suffix instead of dropping it. A child found in a map loaded under a guard therefore
+/// stays allocated until that guard unpins, which is what lets [`Self::get_ref`] lend it
+/// without touching its reference count. Other owners, such as writer lookups, only add
+/// references. Dropping a `NodeChildren` frees its state inline; see `Drop`.
 pub(super) struct NodeChildren {
-    state: ArcSwap<ChildrenState>,
+    /// Never null. Unlinked snapshots are only retired through [`Self::retire`].
+    state: Atomic<ChildrenState>,
 }
 
 impl fmt::Debug for NodeChildren {
@@ -44,6 +183,25 @@ impl fmt::Debug for NodeChildren {
         f.debug_struct("NodeChildren")
             .field("len", &self.len())
             .finish()
+    }
+}
+
+impl Drop for NodeChildren {
+    fn drop(&mut self) {
+        // SAFETY: `&mut self` rules out concurrent loads through this node, and a node is
+        // dropped only after its last `Arc` is released. A reader borrows a child only
+        // through a parent it holds for the borrow's lifetime (`get_ref` ties the borrow to
+        // the parent), and every parent releases a child `Arc` through the epoch, so no
+        // pinned reader can still reach this node or the snapshot it publishes, including
+        // one `transfer_for_split` moved here from the node it split off.
+        //
+        // Freeing inline also keeps deferred destructors from pinning: a pin during
+        // thread exit registers a fresh participant whose first pin collects, so pinning
+        // here would recurse once per expired bag.
+        unsafe {
+            let state = self.state.load(Ordering::Relaxed, epoch::unprotected());
+            drop(state.into_owned());
+        }
     }
 }
 
@@ -63,35 +221,174 @@ impl NodeChildren {
             entries.sort_unstable_by_key(|entry| entry.hash);
             Self::compact_state(entries)
         };
-        Self::from_state(Arc::new(state))
-    }
-
-    fn from_state(state: Arc<ChildrenState>) -> Self {
         Self {
-            state: ArcSwap::new(state),
+            state: Atomic::new(state),
         }
     }
 
+    fn load<'g>(&self, guard: &'g Guard) -> &'g ChildrenState {
+        let state = self.state.load(Ordering::Acquire, guard);
+        // SAFETY: the pointer is never null, and a snapshot unlinked by a writer is
+        // destroyed only after every guard pinned before the unlink is dropped.
+        unsafe { state.deref() }
+    }
+
+    fn with_state<R>(&self, f: impl FnOnce(&ChildrenState) -> R) -> R {
+        let guard = epoch::pin();
+        f(self.load(&guard))
+    }
+
+    /// Publishes `next` unconditionally and retires the previous snapshot.
+    fn replace(&self, next: ChildrenState, guard: &Guard) {
+        let previous = self.state.swap(Owned::new(next), Ordering::AcqRel, guard);
+        // SAFETY: the swap unlinked `previous`.
+        unsafe { Self::retire(previous, guard) };
+    }
+
+    /// Destroys an unlinked snapshot once every thread pinned before the unlink has
+    /// unpinned.
+    ///
+    /// Until it is freed its child `Arc`s are not live references. Each child counts them,
+    /// so the stale-leaf sweep can still require an exact strong count: the count rises
+    /// only after the snapshot is unlinked and falls only when the graveyard frees it.
+    ///
+    /// # Safety
+    ///
+    /// `snapshot` must be unlinked and retired at most once.
+    unsafe fn retire(snapshot: Shared<'_, ChildrenState>, guard: &Guard) {
+        // SAFETY: the caller guarantees `snapshot` is unlinked but not yet destroyed.
+        let entries = unsafe { snapshot.deref() }.compact_entries();
+        for entry in entries {
+            entry.node.note_retired_snapshot_ref();
+        }
+        // SAFETY: pinned readers keep the snapshot alive until they unpin, and no one can
+        // reach it after that.
+        unsafe {
+            guard.defer_unchecked(move || {
+                bury(Grave::Snapshot(snapshot.into_owned().into_box()));
+            });
+        }
+    }
+
+    /// Drops child `Arc`s unlinked in place from a sharded map once every thread pinned
+    /// before the unlink has unpinned, so a reader that borrowed one through
+    /// [`Self::get_ref`] keeps a live node.
+    ///
+    /// The deferred `Arc`s are not counted in `retired_snapshot_refs`: they belong to
+    /// detached children, which the stale-leaf sweep skips because they are no longer in
+    /// their parent's map, and a node is never linked again once unlinked.
+    fn defer_drop(unlinked: Vec<SharedNode>, guard: &Guard) {
+        if unlinked.is_empty() {
+            return;
+        }
+        guard.defer(move || bury(Grave::Nodes(unlinked)));
+    }
+
+    /// Frees this thread's graveyard and the shared one, at most `budget` units of work
+    /// (graves opened plus nodes freed). Event lanes call this. Returns whether both are
+    /// empty.
+    pub(super) fn drain_graveyard(budget: usize) -> bool {
+        Self::drain_graveyard_with(budget, true)
+    }
+
+    /// Frees graveyard garbage iteratively, so deep detached subtrees cannot overflow the
+    /// stack. Leftovers go back to this thread's graveyard.
+    fn drain_graveyard_with(budget: usize, include_shared: bool) -> bool {
+        let mut stack: Vec<SharedNode> = Vec::new();
+        let mut work = 0;
+        while work < budget {
+            if let Some(node) = stack.pop() {
+                if let Some(node) = Arc::into_inner(node) {
+                    stack.extend(node.into_child_arcs());
+                    work += 1;
+                }
+                continue;
+            }
+            let Some(grave) = unbury(include_shared) else {
+                return true;
+            };
+            work += 1;
+            match grave {
+                Grave::Snapshot(snapshot) => {
+                    for entry in snapshot.compact_entries() {
+                        entry.node.release_retired_snapshot_ref();
+                    }
+                    stack.extend(snapshot.into_child_arcs());
+                }
+                Grave::Nodes(nodes) => stack.extend(nodes),
+            }
+        }
+        if !stack.is_empty() {
+            bury(Grave::Nodes(stack));
+        }
+        false
+    }
+
+    /// Takes every child `Arc` out of a map no one else can reach.
+    pub(super) fn into_child_arcs(self) -> Vec<SharedNode> {
+        // SAFETY: `self` is owned, so no thread can load or publish this state.
+        let state = unsafe {
+            self.state
+                .swap(
+                    Owned::new(ChildrenState::Empty),
+                    Ordering::Relaxed,
+                    epoch::unprotected(),
+                )
+                .into_owned()
+        };
+        state.into_box().into_child_arcs()
+    }
+
+    /// Publishes `next` only if `current` is still the published snapshot.
+    fn compare_and_swap<'g>(
+        &self,
+        current: Shared<'g, ChildrenState>,
+        next: ChildrenState,
+        guard: &'g Guard,
+    ) -> bool {
+        match self.state.compare_exchange(
+            current,
+            Owned::new(next),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            guard,
+        ) {
+            Ok(_) => {
+                // SAFETY: the swap unlinked `current`.
+                unsafe { Self::retire(current, guard) };
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Hands this thread's retired snapshots and deferred child drops to the collector and
+    /// collects expired ones. Writers call this when idle so retired child `Arc`s do not
+    /// linger in a quiet thread's local bag.
+    pub(super) fn flush_retired() {
+        epoch::pin().flush();
+    }
+
     pub(super) fn is_empty(&self) -> bool {
-        match &**self.state.load() {
+        self.with_state(|state| match state {
             ChildrenState::Empty => true,
             ChildrenState::Singleton(_) => false,
             ChildrenState::Small(children) => children.is_empty(),
             ChildrenState::Sharded(children) => children.is_empty(),
-        }
+        })
     }
 
     fn len(&self) -> usize {
-        match &**self.state.load() {
+        self.with_state(|state| match state {
             ChildrenState::Empty => 0,
             ChildrenState::Singleton(_) => 1,
             ChildrenState::Small(children) => children.len(),
             ChildrenState::Sharded(children) => children.len(),
-        }
+        })
     }
 
     pub(super) fn get(&self, key: &LocalBlockHash) -> Option<SharedNode> {
-        match &**self.state.load() {
+        self.with_state(|state| match state {
             ChildrenState::Empty => None,
             ChildrenState::Singleton(entry) => (entry.hash == *key).then(|| entry.node.clone()),
             ChildrenState::Small(children) => children
@@ -101,11 +398,44 @@ impl NodeChildren {
             ChildrenState::Sharded(children) => {
                 children.get(key).map(|entry| entry.value().clone())
             }
-        }
+        })
+    }
+
+    /// Borrows the child for `key` while both this map and `guard` live, without cloning
+    /// its `Arc`. Sound by the reclamation invariant on [`NodeChildren`]: the map releases
+    /// its `Arc` only through the epoch, and the borrow cannot outlive the map's owner,
+    /// whose drop frees inline. `guard` must be a real pin, never `epoch::unprotected()`.
+    pub(super) fn get_ref<'g>(
+        &'g self,
+        key: &LocalBlockHash,
+        guard: &'g Guard,
+    ) -> Option<&'g Node> {
+        let child = match self.load(guard) {
+            ChildrenState::Empty => return None,
+            ChildrenState::Singleton(entry) => (entry.hash == *key).then_some(&entry.node)?,
+            ChildrenState::Small(children) => {
+                let index = children
+                    .binary_search_by_key(key, |entry| entry.hash)
+                    .ok()?;
+                &children[index].node
+            }
+            ChildrenState::Sharded(children) => {
+                // Only the node's address leaves the shard lock: the `Arc` slot itself
+                // can move when the shard rehashes.
+                let child = children.get(key)?;
+                // SAFETY: the map owns this `Arc` while the shard lock is held and
+                // releases it only through the epoch (`defer_drop`, or `retire` of the
+                // whole map), which waits for `guard`.
+                return Some(unsafe { &*Arc::as_ptr(child.value()) });
+            }
+        };
+        // SAFETY: `child` lives in a compact snapshot loaded under `guard`, which is
+        // destroyed only after `guard` unpins; the node outlives that `Arc`.
+        Some(unsafe { &*Arc::as_ptr(child) })
     }
 
     pub(super) fn values_snapshot(&self) -> Vec<SharedNode> {
-        match &**self.state.load() {
+        self.with_state(|state| match state {
             ChildrenState::Empty => Vec::new(),
             ChildrenState::Singleton(entry) => vec![entry.node.clone()],
             ChildrenState::Small(children) => {
@@ -114,11 +444,11 @@ impl NodeChildren {
             ChildrenState::Sharded(children) => {
                 children.iter().map(|entry| entry.value().clone()).collect()
             }
-        }
+        })
     }
 
     pub(super) fn entries_snapshot(&self) -> Vec<(LocalBlockHash, SharedNode)> {
-        match &**self.state.load() {
+        self.with_state(|state| match state {
             ChildrenState::Empty => Vec::new(),
             ChildrenState::Singleton(entry) => vec![(entry.hash, entry.node.clone())],
             ChildrenState::Small(children) => children
@@ -129,11 +459,11 @@ impl NodeChildren {
                 .iter()
                 .map(|entry| (*entry.key(), entry.value().clone()))
                 .collect(),
-        }
+        })
     }
 
     pub(super) fn extend_values(&self, queue: &mut VecDeque<SharedNode>) {
-        match &**self.state.load() {
+        self.with_state(|state| match state {
             ChildrenState::Empty => {}
             ChildrenState::Singleton(entry) => queue.push_back(entry.node.clone()),
             ChildrenState::Small(children) => {
@@ -142,33 +472,32 @@ impl NodeChildren {
             ChildrenState::Sharded(children) => {
                 queue.extend(children.iter().map(|entry| entry.value().clone()));
             }
-        }
+        })
     }
 
-    pub(super) fn insert(&self, key: LocalBlockHash, child: SharedNode) -> Option<SharedNode> {
-        let current = self.state.load_full();
-        if let ChildrenState::Sharded(children) = current.as_ref() {
-            return children.insert(key, child);
+    /// Inserts or replaces the child for `key`.
+    pub(super) fn insert(&self, key: LocalBlockHash, child: SharedNode) {
+        let guard = epoch::pin();
+        let current = self.load(&guard);
+        if let ChildrenState::Sharded(children) = current {
+            if let Some(previous) = children.insert(key, child) {
+                Self::defer_drop(vec![previous], &guard);
+            }
+            return;
         }
 
-        let mut entries = Self::clone_compact_entries(current.as_ref(), 1);
-        let previous = match entries.binary_search_by_key(&key, |entry| entry.hash) {
-            Ok(index) => Some(std::mem::replace(&mut entries[index].node, child.clone())),
-            Err(index) => {
-                entries.insert(
-                    index,
-                    ChildEntry {
-                        hash: key,
-                        node: child,
-                    },
-                );
-                None
-            }
-        };
-
-        self.state
-            .store(Arc::new(Self::state_from_entries(entries)));
-        previous
+        let mut entries = Self::clone_compact_entries(current, 1);
+        match entries.binary_search_by_key(&key, |entry| entry.hash) {
+            Ok(index) => entries[index].node = child,
+            Err(index) => entries.insert(
+                index,
+                ChildEntry {
+                    hash: key,
+                    node: child,
+                },
+            ),
+        }
+        self.replace(Self::state_from_entries(entries), &guard);
     }
 
     pub(super) fn insert_if_absent(
@@ -176,9 +505,12 @@ impl NodeChildren {
         key: LocalBlockHash,
         child: SharedNode,
     ) -> ChildInsertResult {
+        let guard = epoch::pin();
         loop {
-            let current = self.state.load_full();
-            let insert_index = match current.as_ref() {
+            let current = self.state.load(Ordering::Acquire, &guard);
+            // SAFETY: see `load`.
+            let current_ref = unsafe { current.deref() };
+            let insert_index = match current_ref {
                 ChildrenState::Empty => 0,
                 ChildrenState::Singleton(entry) if entry.hash == key => {
                     return ChildInsertResult::Existing(entry.node.clone());
@@ -203,7 +535,7 @@ impl NodeChildren {
                 }
             };
 
-            let mut entries = Self::clone_compact_entries(current.as_ref(), 1);
+            let mut entries = Self::clone_compact_entries(current_ref, 1);
             entries.insert(
                 insert_index,
                 ChildEntry {
@@ -211,50 +543,63 @@ impl NodeChildren {
                     node: child.clone(),
                 },
             );
-            if self.compare_and_swap(&current, Self::state_from_entries(entries)) {
+            if self.compare_and_swap(current, Self::state_from_entries(entries), &guard) {
                 return ChildInsertResult::Inserted(child);
             }
         }
     }
 
-    pub(super) fn remove(&self, key: &LocalBlockHash) -> Option<SharedNode> {
-        let current = self.state.load_full();
-        let remove_index = match current.as_ref() {
-            ChildrenState::Empty => return None,
+    /// Unlinks the child for `key`, returning whether it was present.
+    pub(super) fn remove(&self, key: &LocalBlockHash) -> bool {
+        let guard = epoch::pin();
+        let current = self.load(&guard);
+        let remove_index = match current {
+            ChildrenState::Empty => return false,
             ChildrenState::Singleton(entry) => {
                 if entry.hash != *key {
-                    return None;
+                    return false;
                 }
                 0
             }
             ChildrenState::Small(entries) => {
                 let Ok(index) = entries.binary_search_by_key(key, |entry| entry.hash) else {
-                    return None;
+                    return false;
                 };
                 index
             }
             ChildrenState::Sharded(children) => {
-                return children.remove(key).map(|(_, child)| child);
+                let Some((_, removed)) = children.remove(key) else {
+                    return false;
+                };
+                Self::defer_drop(vec![removed], &guard);
+                return true;
             }
         };
 
-        let mut entries = Self::clone_compact_entries(current.as_ref(), 0);
-        let removed = entries.remove(remove_index);
-        self.state.store(Arc::new(Self::compact_state(entries)));
-        Some(removed.node)
+        let mut entries = Self::clone_compact_entries(current, 0);
+        entries.remove(remove_index);
+        self.replace(Self::compact_state(entries), &guard);
+        true
     }
 
     pub(super) fn clear(&self) -> bool {
-        let current = self.state.load_full();
-        match current.as_ref() {
+        let guard = epoch::pin();
+        match self.load(&guard) {
             ChildrenState::Empty => false,
             ChildrenState::Sharded(children) => {
-                let had_children = !children.is_empty();
-                children.clear();
-                had_children
+                let mut removed = Vec::with_capacity(children.len());
+                children.retain(|_, child| {
+                    removed.push(child.clone());
+                    false
+                });
+                if removed.is_empty() {
+                    return false;
+                }
+                Self::defer_drop(removed, &guard);
+                true
             }
             ChildrenState::Singleton(_) | ChildrenState::Small(_) => {
-                self.state.store(Arc::new(ChildrenState::Empty));
+                self.replace(ChildrenState::Empty, &guard);
                 true
             }
         }
@@ -263,9 +608,17 @@ impl NodeChildren {
     /// Transfers the current state while the owning node's exclusive shape gate is held.
     /// The suffix keeps its representation; the prefix restarts with compact children.
     pub(super) fn transfer_for_split(&self) -> Self {
-        let current = self.state.load_full();
-        self.state.store(Arc::new(ChildrenState::Empty));
-        Self::from_state(current)
+        let guard = epoch::pin();
+        let current = self
+            .state
+            .swap(Owned::new(ChildrenState::Empty), Ordering::AcqRel, &guard);
+        // The snapshot moves to the suffix unchanged. Readers that loaded it from this
+        // node keep reading a live allocation; it is retired when the suffix replaces it,
+        // and the suffix itself is dropped only after this node's compact map, which the
+        // caller publishes it into, retires its reference (see `Drop`).
+        Self {
+            state: Atomic::from(current),
+        }
     }
 
     /// Copies compact entries with room for `spare` more, so inserting a new key neither
@@ -304,19 +657,14 @@ impl NodeChildren {
         }
     }
 
-    fn compare_and_swap(&self, current: &Arc<ChildrenState>, next: ChildrenState) -> bool {
-        let previous = self.state.compare_and_swap(current, Arc::new(next));
-        Arc::ptr_eq(current, &*previous)
-    }
-
     #[cfg(test)]
     fn kind(&self) -> ChildrenKind {
-        match &**self.state.load() {
+        self.with_state(|state| match state {
             ChildrenState::Empty => ChildrenKind::Empty,
             ChildrenState::Singleton(_) => ChildrenKind::Singleton,
             ChildrenState::Small(_) => ChildrenKind::Small,
             ChildrenState::Sharded(_) => ChildrenKind::Sharded,
-        }
+        })
     }
 }
 
@@ -331,12 +679,12 @@ enum ChildrenKind {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
     use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::indexer::concurrent_radix_tree_compressed::node::Node;
 
     fn child() -> SharedNode {
         Arc::new(Node::new())
@@ -354,8 +702,8 @@ mod tests {
         assert_eq!(children.kind(), ChildrenKind::Small);
 
         for key in (1..SMALL_CHILD_LIMIT).rev() {
-            let removed = children.remove(&LocalBlockHash(key as u64)).unwrap();
-            assert!(Arc::ptr_eq(&removed, &nodes[key]));
+            assert!(children.remove(&LocalBlockHash(key as u64)));
+            assert!(children.get(&LocalBlockHash(key as u64)).is_none());
         }
         assert_eq!(children.kind(), ChildrenKind::Singleton);
         assert!(Arc::ptr_eq(
@@ -363,7 +711,8 @@ mod tests {
             &nodes[0]
         ));
 
-        children.remove(&LocalBlockHash(0)).unwrap();
+        assert!(children.remove(&LocalBlockHash(0)));
+        assert!(!children.remove(&LocalBlockHash(0)));
         assert_eq!(children.kind(), ChildrenKind::Empty);
         assert!(children.is_empty());
     }
@@ -380,7 +729,7 @@ mod tests {
         assert_eq!(children.len(), SMALL_CHILD_LIMIT + 1);
 
         for key in 0..=SMALL_CHILD_LIMIT {
-            children.remove(&LocalBlockHash(key as u64)).unwrap();
+            assert!(children.remove(&LocalBlockHash(key as u64)));
         }
         assert!(children.is_empty());
         assert_eq!(children.kind(), ChildrenKind::Sharded);
@@ -424,8 +773,10 @@ mod tests {
             children.insert(LocalBlockHash(key as u64), node.clone());
         }
 
-        let stale = children.state.load_full();
-        let mut stale_entries = NodeChildren::clone_compact_entries(stale.as_ref(), 0);
+        let guard = epoch::pin();
+        let stale = children.state.load(Ordering::Acquire, &guard);
+        // SAFETY: `guard` keeps the snapshot alive for the rest of the test.
+        let mut stale_entries = NodeChildren::clone_compact_entries(unsafe { stale.deref() }, 0);
         stale_entries.remove(0);
         let replacement = child();
         let replacement_index = stale_entries
@@ -451,7 +802,11 @@ mod tests {
         start.wait();
         promoted.wait();
         assert_eq!(children.kind(), ChildrenKind::Sharded);
-        assert!(!children.compare_and_swap(&stale, NodeChildren::compact_state(stale_entries)));
+        assert!(!children.compare_and_swap(
+            stale,
+            NodeChildren::compact_state(stale_entries),
+            &guard
+        ));
         assert!(matches!(
             handle.join().unwrap(),
             ChildInsertResult::Inserted(_)
@@ -541,6 +896,63 @@ mod tests {
         assert_eq!(children.len(), THREADS);
         for key in 0..THREADS {
             assert!(children.get(&LocalBlockHash(key as u64)).is_some());
+        }
+    }
+    /// Flushes and collects until `node` has `expected` strong references. Other tests'
+    /// pins on the global collector can delay reclamation, so this polls.
+    fn wait_for_strong_count(node: &SharedNode, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Arc::strong_count(node) != expected {
+            assert!(Instant::now() < deadline, "deferred child drops never ran");
+            NodeChildren::flush_retired();
+            NodeChildren::drain_graveyard(usize::MAX);
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn sharded_child_unlink_defers_arc_drop() {
+        type Unlink = fn(&NodeChildren, LocalBlockHash);
+        let unlinks: [(&str, Unlink); 3] = [
+            ("insert_replace", |children, key| {
+                children.insert(key, child())
+            }),
+            ("remove", |children, key| assert!(children.remove(&key))),
+            ("clear", |children, _| assert!(children.clear())),
+        ];
+
+        for (name, unlink) in unlinks {
+            let children = NodeChildren::from_map(FxHashMap::default());
+            let nodes: Vec<_> = (0..=SMALL_CHILD_LIMIT).map(|_| child()).collect();
+            for (key, node) in nodes.iter().enumerate() {
+                children.insert(LocalBlockHash(key as u64), node.clone());
+            }
+            assert_eq!(children.kind(), ChildrenKind::Sharded, "{name}");
+            let key = LocalBlockHash(0);
+            let target = &nodes[0];
+            // Drain the compact snapshots retired while filling the map.
+            wait_for_strong_count(target, 2);
+
+            let guard = epoch::pin();
+            let borrowed = children.get_ref(&key, &guard).unwrap();
+            assert!(std::ptr::eq(borrowed, Arc::as_ptr(target)), "{name}");
+
+            unlink(&children, key);
+            for _ in 0..8 {
+                NodeChildren::flush_retired();
+            }
+            // The map's reference waits for `guard`, so the borrow stays valid.
+            assert_eq!(Arc::strong_count(target), 2, "{name}");
+            assert_eq!(borrowed.edge_len_for_test(), 0, "{name}");
+            assert!(
+                children
+                    .get(&key)
+                    .is_none_or(|current| !Arc::ptr_eq(&current, target)),
+                "{name}"
+            );
+
+            drop(guard);
+            wait_for_strong_count(target, 1);
         }
     }
 }

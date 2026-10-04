@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
+use super::block_lookup::BlockLookup;
+use super::coverage::{Slot, SlotSet, SlotTable};
 use super::node::Node;
 use crate::protocols::*;
 
@@ -16,7 +18,7 @@ pub(super) type SharedNode = Arc<Node>;
 /// Maps each `ExternalSequenceBlockHash` to the node whose `edge` contains it.
 /// Position within the edge is resolved via `Node::edge_index` (O(1)) rather than
 /// stored here, keeping the map compact and correct across concurrent splits.
-pub(super) type WorkerLookup = FxHashMap<ExternalSequenceBlockHash, SharedNode>;
+pub(super) type WorkerLookup = BlockLookup<SharedNode>;
 
 #[derive(Clone, Copy)]
 pub(super) enum WorkerRemovalTarget {
@@ -33,12 +35,13 @@ impl WorkerRemovalTarget {
     }
 }
 
-pub(super) struct MatchWalkResult {
-    // NOTE(perf): Replacing this set with a Vec did not improve throughput. Keep
-    // uniqueness by construction unless a new profile justifies changing it.
-    pub(super) active: FxHashSet<WorkerWithDpRank>,
-    pub(super) matched_depth: u32,
-    pub(super) prev_edge_last_hash: Option<ExternalSequenceBlockHash>,
+/// The rank an event applies to, the slot it writes coverage with, and the slot table
+/// the slot was resolved in. The table stays valid for the event's epoch guard.
+#[derive(Clone, Copy)]
+pub(super) struct EventWorker<'g> {
+    pub(super) rank: WorkerWithDpRank,
+    pub(super) slot: Slot,
+    pub(super) table: &'g SlotTable,
 }
 
 // For short anchored reads this avoids a Vec allocation. For long suffixes,
@@ -97,36 +100,41 @@ pub(super) struct UncoveredParent {
     pub(super) cutoff: usize,
 }
 
+/// The store worker's coverage of a parent hash, read under the node lock.
+pub(super) enum ParentCoverage {
+    Covered,
+    Uncovered(UncoveredParent),
+    /// The hash is not in this edge: the lookup entry is stale after a split.
+    Missing,
+}
+
 pub(super) struct FindStepInput<'a, S: HashSequence> {
     pub(super) sequence: &'a S,
     pub(super) seq_pos: usize,
     pub(super) first_node: bool,
     pub(super) prev_depth: u32,
     pub(super) prev_edge_last_hash: Option<ExternalSequenceBlockHash>,
-    pub(super) active: &'a mut FxHashSet<WorkerWithDpRank>,
-    pub(super) active_count: usize,
+    /// Maps slots to the ranks credited for them, loaded once per walk.
+    pub(super) table: &'a SlotTable,
+    pub(super) active: &'a mut SlotSet,
     pub(super) scores: &'a mut OverlapScores,
     pub(super) last_matched_hashes:
         Option<&'a mut FxHashMap<WorkerWithDpRank, ExternalSequenceBlockHash>>,
     pub(super) kv_transfer_chain: Option<&'a mut Vec<ExternalSequenceBlockHash>>,
 }
 
-pub(super) struct FindStepOutcome {
+pub(super) struct FindStepOutcome<'g> {
     pub(super) edge_len: usize,
     pub(super) edge_match_len: usize,
     pub(super) active_count: usize,
-    pub(super) next_child: Option<SharedNode>,
+    /// Borrowed under the walk's epoch guard.
+    pub(super) next_child: Option<&'g Node>,
     pub(super) prev_edge_last_hash: Option<ExternalSequenceBlockHash>,
 }
 
 /// Data returned by a split for deferred lookup updates.
 pub(super) struct SplitLookupData {
     pub(super) suffix: SharedNode,
-}
-
-pub(super) struct RemoveBatchOutcome {
-    pub(super) stale_hashes: Vec<ExternalSequenceBlockHash>,
-    pub(super) unmatched_hashes: Vec<ExternalSequenceBlockHash>,
 }
 
 #[derive(Clone, Copy)]
@@ -163,9 +171,17 @@ pub(super) struct ParentEdgePlan {
 
 pub(super) enum ParentEdgePlanAction {
     InsertFromParent,
-    ReuseExistingEdge { cutoff: usize },
-    ReuseSuffixAndExtendLeaf { append_start: usize },
-    Split { split_pos: usize },
+    /// `covers_edge` records whether `cutoff` reaches the end of the edge as planned.
+    ReuseExistingEdge {
+        cutoff: usize,
+        covers_edge: bool,
+    },
+    ReuseSuffixAndExtendLeaf {
+        append_start: usize,
+    },
+    Split {
+        split_pos: usize,
+    },
 }
 
 pub(super) struct ChildEdgeScan {

@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{self, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-use parking_lot::RwLock;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use crossbeam_epoch::Guard;
+use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
+use rustc_hash::FxHashMap;
 
 use super::children::{ChildInsertResult, NodeChildren};
+use super::coverage::{FullCoverage, Slot, SlotSet, SlotTable};
+use super::state::{CrtcNodeState, RemoveOutcome};
 use super::types::*;
-use crate::indexer::compressed_radix::NodeState;
 use crate::protocols::*;
 
 fn record_last_matched_hash(
@@ -40,45 +42,35 @@ pub(super) struct Node {
     /// Sticky logical-internal marker. Once true, this node is treated as
     /// internal even if cleanup removes all physical children later.
     internal: AtomicBool,
-    state: RwLock<NodeState>,
+    /// Set only for synthetic branch anchors, which live in `anchor_nodes` for the
+    /// tree's lifetime and never change their single-block edge.
+    anchor: bool,
+    /// Ranks covering the whole edge. Readers load the bits under the state read lock,
+    /// so they see bits consistent with the edge. A bit is set under the shared shape
+    /// gate (see `promote_full`) or with the state write lock held; a slot dropped from
+    /// the whole edge is cleared under the exclusive gate. Splits and extensions, which
+    /// move bits between nodes or demote them to cutoffs, hold the exclusive gate.
+    full: FullCoverage,
+    state: RwLock<CrtcNodeState>,
+    /// Whether `state.cutoffs` is non-empty, republished whenever the state write lock
+    /// is released, so a promote can skip the state lock when it has no cutoff to delete.
+    has_cutoffs: AtomicBool,
     children: NodeChildren,
+    /// Strong references to this node held by retired child-map snapshots that are
+    /// awaiting epoch reclamation. Never larger than the actual number.
+    retired_snapshot_refs: AtomicUsize,
 }
 
 impl Node {
     pub(super) fn new() -> Self {
-        Self::from_state_and_children(
-            NodeState {
-                edge: Vec::new(),
-                edge_index: FxHashMap::default(),
-                worker_cutoffs: FxHashMap::default(),
-                full_edge_workers: FxHashSet::default(),
-            },
-            FxHashMap::default(),
-        )
+        Self::childless(CrtcNodeState::new(Vec::new()), FullCoverage::default())
     }
 
-    pub(super) fn from_blocks_for_worker(
-        blocks: &[KvCacheStoredBlockData],
-        worker: WorkerWithDpRank,
-    ) -> Self {
+    pub(super) fn from_blocks_for_slot(blocks: &[KvCacheStoredBlockData], slot: Slot) -> Self {
         debug_assert!(!blocks.is_empty());
-
-        let edge: Vec<(LocalBlockHash, ExternalSequenceBlockHash)> = blocks
-            .iter()
-            .map(|block| (block.tokens_hash, block.block_hash))
-            .collect();
-        let edge_index = NodeState::edge_index_for(&edge);
-        let mut full_edge_workers = FxHashSet::with_capacity_and_hasher(1, FxBuildHasher);
-        full_edge_workers.insert(worker);
-
-        Self::from_state_and_children(
-            NodeState {
-                edge,
-                edge_index,
-                worker_cutoffs: FxHashMap::default(),
-                full_edge_workers,
-            },
-            FxHashMap::default(),
+        Self::childless(
+            CrtcNodeState::for_blocks(blocks),
+            FullCoverage::single(slot),
         )
     }
 
@@ -86,39 +78,63 @@ impl Node {
         anchor_local_hash: LocalBlockHash,
         anchor_id: ExternalSequenceBlockHash,
     ) -> Self {
-        let edge = vec![(anchor_local_hash, anchor_id)];
-        let edge_index = NodeState::edge_index_for(&edge);
-
-        Self::from_state_and_children(
-            NodeState {
-                edge,
-                edge_index,
-                worker_cutoffs: FxHashMap::default(),
-                full_edge_workers: FxHashSet::default(),
-            },
-            FxHashMap::default(),
-        )
+        let mut node = Self::childless(
+            CrtcNodeState::new(vec![(anchor_local_hash, anchor_id)]),
+            FullCoverage::default(),
+        );
+        node.anchor = true;
+        node
     }
 
-    fn from_state_and_children(
-        state: NodeState,
-        children: FxHashMap<LocalBlockHash, SharedNode>,
-    ) -> Self {
-        Self::from_state_and_node_children(state, NodeChildren::from_map(children))
+    fn childless(state: CrtcNodeState, full: FullCoverage) -> Self {
+        Self::from_parts(state, full, NodeChildren::from_map(FxHashMap::default()))
     }
 
-    fn from_state_and_node_children(state: NodeState, children: NodeChildren) -> Self {
+    fn from_parts(state: CrtcNodeState, full: FullCoverage, children: NodeChildren) -> Self {
         let internal = !children.is_empty();
         Self {
             shape_gate: RwLock::new(()),
             shape_version: AtomicU64::new(0),
             internal: AtomicBool::new(internal),
+            anchor: false,
+            full,
+            has_cutoffs: AtomicBool::new(!state.cutoffs.is_empty()),
             state: RwLock::new(state),
             children,
+            retired_snapshot_refs: AtomicUsize::new(0),
         }
     }
 
-    fn with_shape_plan<R>(&self, plan: impl FnOnce(&NodeState, &NodeChildren, u64) -> R) -> R {
+    fn write_state(&self) -> StateWriteGuard<'_> {
+        StateWriteGuard {
+            has_cutoffs: &self.has_cutoffs,
+            state: self.state.write(),
+        }
+    }
+
+    pub(super) fn note_retired_snapshot_ref(&self) {
+        self.retired_snapshot_refs.fetch_add(1, Ordering::Release);
+    }
+
+    pub(super) fn release_retired_snapshot_ref(&self) {
+        self.retired_snapshot_refs.fetch_sub(1, Ordering::Release);
+    }
+
+    /// Strong references other than those held by retired child-map snapshots, or
+    /// `None` if a snapshot was reclaimed during the read.
+    ///
+    /// Callers hold the parent's exclusive shape gate, so no snapshot holding this node
+    /// can be retired meanwhile; the count can only fall. Equal reads before and after
+    /// the strong count therefore bracket a strong count with no reclamation in between.
+    fn live_strong_count(this: &SharedNode) -> Option<usize> {
+        let retired = this.retired_snapshot_refs.load(Ordering::Acquire);
+        let strong = Arc::strong_count(this);
+        atomic::fence(Ordering::Acquire);
+        (this.retired_snapshot_refs.load(Ordering::Acquire) == retired)
+            .then(|| strong.saturating_sub(retired))
+    }
+
+    fn with_shape_plan<R>(&self, plan: impl FnOnce(&CrtcNodeState, &NodeChildren, u64) -> R) -> R {
         // NOTE(perf): Replacing these shape-gated reads with state-only snapshots
         // was neutral or regressive, and profiling did not identify the RwLock
         // as a hotspot. Re-profile before removing this shape read.
@@ -139,10 +155,10 @@ impl Node {
     fn apply_metadata_update<R>(
         &self,
         expected_version: u64,
-        f: impl FnOnce(&mut NodeState) -> R,
+        f: impl FnOnce(&mut CrtcNodeState) -> R,
     ) -> Option<R> {
         self.validate_shape_read(expected_version, || {
-            let mut state = self.state.write();
+            let mut state = self.write_state();
             f(&mut state)
         })
     }
@@ -150,14 +166,14 @@ impl Node {
     fn apply_edge_shape_update<R>(
         &self,
         expected_version: u64,
-        f: impl FnOnce(&mut NodeState, &NodeChildren) -> (R, bool),
+        f: impl FnOnce(&mut CrtcNodeState, &NodeChildren) -> (R, bool),
     ) -> Option<R> {
         let _gate = self.shape_gate.write();
         if self.shape_version.load(Ordering::Acquire) != expected_version {
             return None;
         }
 
-        let mut state = self.state.write();
+        let mut state = self.write_state();
         let (result, shape_changed) = f(&mut state, &self.children);
         if shape_changed {
             self.shape_version.fetch_add(1, Ordering::Release);
@@ -189,17 +205,27 @@ impl Node {
         self.children.entries_snapshot()
     }
 
+    #[cfg(test)]
     pub(super) fn child_snapshot(&self, local_hash: LocalBlockHash) -> Option<SharedNode> {
         self.children.get(&local_hash)
     }
 
-    /// Number of leading `hashes` present in this node's edge, read under one lock.
-    pub(super) fn leading_edge_hash_count(&self, hashes: &[ExternalSequenceBlockHash]) -> usize {
-        let state = self.state.read();
-        hashes
-            .iter()
-            .take_while(|hash| state.edge_index.contains_key(hash))
-            .count()
+    pub(super) fn is_anchor(&self) -> bool {
+        self.anchor
+    }
+
+    /// Borrows a child for the life of `guard`; see [`NodeChildren::get_ref`].
+    pub(super) fn child_ref<'g>(
+        &'g self,
+        local_hash: LocalBlockHash,
+        guard: &'g Guard,
+    ) -> Option<&'g Node> {
+        self.children.get_ref(&local_hash, guard)
+    }
+
+    /// Takes this node's child `Arc`s so the graveyard can free a subtree iteratively.
+    pub(super) fn into_child_arcs(self) -> Vec<SharedNode> {
+        self.children.into_child_arcs()
     }
 
     pub(super) fn contains_edge_hash(&self, hash: ExternalSequenceBlockHash) -> bool {
@@ -209,6 +235,51 @@ impl Node {
     #[cfg(test)]
     pub(super) fn edge_len_for_test(&self) -> usize {
         self.state.read().edge.len()
+    }
+
+    /// Full-edge slots and cutoffs, read under one state lock.
+    #[cfg(test)]
+    pub(super) fn coverage_for_test(&self) -> (SlotSet, Vec<(Slot, usize)>) {
+        let state = self.state.read();
+        (self.full.snapshot(), state.cutoffs.iter().collect())
+    }
+
+    #[cfg(test)]
+    pub(super) fn shape_version_for_test(&self) -> u64 {
+        self.shape_version.load(Ordering::Acquire)
+    }
+
+    /// Replaces this node's coverage without any version change.
+    #[cfg(test)]
+    pub(super) fn set_coverage_for_test(&self, full: &[Slot], cutoffs: &[(Slot, usize)]) {
+        let mut state = self.write_state();
+        self.full.remove_all(&self.full.snapshot());
+        for &slot in full {
+            self.full.insert(slot);
+        }
+        state.cutoffs = Default::default();
+        for &(slot, cutoff) in cutoffs {
+            state.cutoffs.insert(slot, cutoff);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn attach_child_for_test(&self, child: SharedNode) {
+        let key = child.state.read().edge[0].0;
+        let _gate = self.shape_gate.write();
+        self.children.insert(key, child);
+        self.internal.store(true, Ordering::Release);
+        self.shape_version.fetch_add(1, Ordering::Release);
+    }
+
+    /// Splits this node at `pos` as a store would, returning the suffix.
+    #[cfg(test)]
+    pub(super) fn split_for_test(&self, pos: usize) -> SharedNode {
+        let version = self.shape_version.load(Ordering::Acquire);
+        self.apply_edge_shape_update(version, |state, _children| {
+            (self.split_at_locked(state, pos).suffix, true)
+        })
+        .expect("no concurrent shape change in a test")
     }
 
     #[cfg(test)]
@@ -221,30 +292,45 @@ impl Node {
             .collect()
     }
 
-    pub(super) fn promote_worker_to_full_edge(&self, worker: WorkerWithDpRank) -> bool {
+    pub(super) fn promote_slot_to_full_edge(&self, slot: Slot) -> bool {
         // NOTE(perf): This path is anchor-only today. Removing its shape read
         // did not improve throughput; re-evaluate if non-anchor callers appear.
-        let _gate = self.shape_gate.read();
-        self.state.write().promote_to_full(worker)
+        self.promote_full(slot, None) == Some(true)
     }
 
-    pub(super) fn remove_target_and_snapshot_children(
-        &self,
-        target: WorkerRemovalTarget,
-    ) -> Vec<SharedNode> {
+    /// Marks `slot` as covering the whole edge, if the shape is still `expected_version`.
+    /// Returns whether its coverage changed, or `None` if the shape moved.
+    ///
+    /// The bit is set under the shared gate alone: every update that moves bits or
+    /// reads them to change the shape holds the exclusive gate, and readers already
+    /// load bits under the state lock. The state write lock is taken only to delete
+    /// a stale cutoff, after the bit is set, so readers never miss the slot.
+    fn promote_full(&self, slot: Slot, expected_version: Option<u64>) -> Option<bool> {
+        let _gate = self.shape_gate.read();
+        // Validate before trusting a set bit: a split also sets it, when it promotes the
+        // slot's cutoff on the prefix, and then leaves only a cutoff on the suffix.
+        if expected_version
+            .is_some_and(|version| self.shape_version.load(Ordering::Acquire) != version)
+        {
+            return None;
+        }
+        if self.full.contains(slot) || !self.full.insert(slot) {
+            return Some(false);
+        }
+        if self.has_cutoffs.load(Ordering::Acquire) {
+            self.write_state().cutoffs.remove(slot);
+        }
+        Some(true)
+    }
+
+    pub(super) fn remove_slots_and_snapshot_children(&self, slots: &SlotSet) -> Vec<SharedNode> {
         let _gate = self.shape_gate.write();
-        let mut state = self.state.write();
-        let old_full_len = state.full_edge_workers.len();
-        let old_cutoff_len = state.worker_cutoffs.len();
-        state
-            .full_edge_workers
-            .retain(|worker| !target.matches(*worker));
-        state
-            .worker_cutoffs
-            .retain(|worker, _| !target.matches(*worker));
-        let removed_worker = old_full_len != state.full_edge_workers.len()
-            || old_cutoff_len != state.worker_cutoffs.len();
-        let should_clear_children = removed_worker && state.full_edge_workers.is_empty();
+        let mut state = self.write_state();
+        let old_cutoff_len = state.cutoffs.len();
+        state.cutoffs.retain(|slot| !slots.contains(slot));
+        let removed_full = self.full.remove_all(slots);
+        let removed_worker = removed_full || old_cutoff_len != state.cutoffs.len();
+        let should_clear_children = removed_worker && self.full.is_empty();
 
         // A concurrent split is either visible in this snapshot or starts after
         // the target coverage is gone and therefore cannot copy it forward.
@@ -260,75 +346,70 @@ impl Node {
         }
     }
 
+    fn has_any_workers(&self) -> bool {
+        self.state.read().has_any_workers(&self.full)
+    }
+
     pub(super) fn live_children(&self) -> Vec<SharedNode> {
         let _gate = self.shape_gate.read();
         self.children
             .values_snapshot()
             .into_iter()
-            .filter(|child| child.state.read().has_any_workers() || !child.children.is_empty())
+            .filter(|child| child.has_any_workers() || !child.children.is_empty())
             .collect()
     }
 
-    pub(super) fn dump_snapshot(&self) -> DumpNodeSnapshot {
+    pub(super) fn dump_snapshot(&self, table: &SlotTable) -> DumpNodeSnapshot {
         let _gate = self.shape_gate.read();
         let state = self.state.read();
         let live_children: Vec<_> = self
             .children
             .values_snapshot()
             .into_iter()
-            .filter(|child| child.state.read().has_any_workers() || !child.children.is_empty())
+            .filter(|child| child.has_any_workers() || !child.children.is_empty())
             .collect();
 
-        let can_merge = state.worker_cutoffs.is_empty()
+        let full = self.full.snapshot();
+        let can_merge = state.cutoffs.is_empty()
             && live_children.len() == 1
-            && live_children[0].has_full_coverage_only_matching(&state.full_edge_workers);
+            && live_children[0].has_full_coverage_only_matching(&full);
 
         DumpNodeSnapshot {
             edge: state.edge.clone(),
-            full_edge_workers: state.full_edge_workers.iter().copied().collect(),
+            full_edge_workers: full.iter().filter_map(|slot| table.owner(slot)).collect(),
             worker_cutoffs: state
-                .worker_cutoffs
+                .cutoffs
                 .iter()
-                .map(|(&worker, &cutoff)| (worker, cutoff))
+                .filter_map(|(slot, cutoff)| Some((table.owner(slot)?, cutoff)))
                 .collect(),
             live_children,
-            has_any_workers: state.has_any_workers(),
+            has_any_workers: state.has_any_workers(&self.full),
             children_empty: self.children.is_empty(),
             can_merge,
         }
     }
 
-    fn has_full_coverage_only_matching(&self, workers: &FxHashSet<WorkerWithDpRank>) -> bool {
+    fn has_full_coverage_only_matching(&self, slots: &SlotSet) -> bool {
         let state = self.state.read();
-        state.worker_cutoffs.is_empty()
-            && state.full_edge_workers == *workers
-            && state.has_any_workers()
+        state.cutoffs.is_empty() && self.full.snapshot() == *slots && !slots.is_empty()
     }
 
-    pub(super) fn lookup_entries_by_worker(
+    /// The edge's hashes and how far each slot in `slots` covers them, read under one lock.
+    pub(super) fn covered_prefixes(
         &self,
-    ) -> Vec<(WorkerWithDpRank, Vec<ExternalSequenceBlockHash>)> {
+        slots: impl Iterator<Item = Option<Slot>>,
+    ) -> (Vec<ExternalSequenceBlockHash>, Vec<usize>) {
         let state = self.state.read();
-        let mut entries = Vec::new();
-
-        for &worker in &state.full_edge_workers {
-            entries.push((worker, state.edge.iter().map(|&(_, hash)| hash).collect()));
-        }
-        for (&worker, &cutoff) in &state.worker_cutoffs {
-            if cutoff > 0 {
-                entries.push((
-                    worker,
-                    state.edge[..cutoff].iter().map(|&(_, hash)| hash).collect(),
-                ));
-            }
-        }
-
-        entries
+        let cutoffs = slots
+            .map(|slot| slot.map_or(0, |slot| state.current_cutoff(&self.full, slot)))
+            .collect();
+        let hashes = state.edge.iter().map(|&(_, hash)| hash).collect();
+        (hashes, cutoffs)
     }
 
-    pub(super) fn lookup_hashes_for_worker_repair(
+    pub(super) fn lookup_hashes_for_slot_repair(
         &self,
-        worker: WorkerWithDpRank,
+        slot: Slot,
         hash: ExternalSequenceBlockHash,
         direction: LookupRepairDirection,
     ) -> Vec<ExternalSequenceBlockHash> {
@@ -336,7 +417,7 @@ impl Node {
         let Some(&pos) = state.edge_index.get(&hash) else {
             return Vec::new();
         };
-        let cutoff = state.current_cutoff(worker).min(state.edge.len());
+        let cutoff = state.current_cutoff(&self.full, slot).min(state.edge.len());
         let range = match direction {
             LookupRepairDirection::TowardTail => {
                 if pos < cutoff {
@@ -351,20 +432,22 @@ impl Node {
         state.edge[range].iter().map(|&(_, hash)| hash).collect()
     }
 
-    pub(super) fn reject_uncovered_parent(
+    pub(super) fn parent_coverage(
         &self,
-        worker: WorkerWithDpRank,
+        slot: Slot,
         parent_hash: ExternalSequenceBlockHash,
-    ) -> Option<UncoveredParent> {
+    ) -> ParentCoverage {
         let _gate = self.shape_gate.read();
         let state = self.state.read();
-        let &pos = state.edge_index.get(&parent_hash)?;
-        if state.covers_pos(worker, pos) {
-            return None;
+        let Some(&pos) = state.edge_index.get(&parent_hash) else {
+            return ParentCoverage::Missing;
+        };
+        if state.covers_pos(&self.full, slot, pos) {
+            return ParentCoverage::Covered;
         }
-        Some(UncoveredParent {
+        ParentCoverage::Uncovered(UncoveredParent {
             pos,
-            cutoff: state.current_cutoff(worker),
+            cutoff: state.current_cutoff(&self.full, slot),
         })
     }
 
@@ -379,8 +462,10 @@ impl Node {
             let action = if state.tail_hash_is(parent_hash) {
                 ParentEdgePlanAction::InsertFromParent
             } else if state.suffix_matches_store(parent_pos, blocks) {
+                let cutoff = parent_pos + 1 + blocks.len();
                 ParentEdgePlanAction::ReuseExistingEdge {
-                    cutoff: parent_pos + 1 + blocks.len(),
+                    cutoff,
+                    covers_edge: cutoff >= state.edge.len(),
                 }
             } else if !self.internal.load(Ordering::Acquire) {
                 match state.store_starts_with_suffix(parent_pos, blocks) {
@@ -406,7 +491,7 @@ impl Node {
 
     pub(super) fn apply_store_parent_edge_plan(
         &self,
-        worker: WorkerWithDpRank,
+        slot: Slot,
         plan: ParentEdgePlan,
         blocks: &[KvCacheStoredBlockData],
     ) -> ParentEdgeAction {
@@ -418,20 +503,25 @@ impl Node {
                     ParentEdgeAction::InsertFromParent(None)
                 })
                 .unwrap_or(ParentEdgeAction::Stale),
-            ParentEdgePlanAction::ReuseExistingEdge { cutoff } => self
-                .apply_metadata_update(plan.shape_version, |state| {
-                    ParentEdgeAction::ReuseExistingEdge {
-                        coverage_changed: state.cover_prefix_for_worker(worker, cutoff),
-                    }
-                })
-                .unwrap_or(ParentEdgeAction::Stale),
+            ParentEdgePlanAction::ReuseExistingEdge {
+                covers_edge: true, ..
+            } => self
+                .promote_full(slot, Some(plan.shape_version))
+                .map_or(ParentEdgeAction::Stale, |coverage_changed| {
+                    ParentEdgeAction::ReuseExistingEdge { coverage_changed }
+                }),
+            ParentEdgePlanAction::ReuseExistingEdge { cutoff, .. } => self
+                .cover_prefix_with_version(slot, cutoff, plan.shape_version)
+                .map_or(ParentEdgeAction::Stale, |coverage_changed| {
+                    ParentEdgeAction::ReuseExistingEdge { coverage_changed }
+                }),
             // NOTE(perf): An additional sticky-internal rejection before this
             // commit did not improve throughput. The check inside the gate
             // closes the split race.
             ParentEdgePlanAction::ReuseSuffixAndExtendLeaf { append_start } => self
                 .apply_edge_shape_update(plan.shape_version, |state, _children| {
                     if !self.internal.load(Ordering::Acquire) {
-                        state.append_blocks_to_leaf(worker, &blocks[append_start..]);
+                        state.append_blocks_to_leaf(&self.full, slot, &blocks[append_start..]);
                         (
                             ParentEdgeAction::ReuseExistingEdge {
                                 coverage_changed: true,
@@ -474,28 +564,28 @@ impl Node {
         })
     }
 
-    pub(super) fn cover_prefix_for_worker_with_version(
+    pub(super) fn cover_prefix_with_version(
         &self,
-        worker: WorkerWithDpRank,
+        slot: Slot,
         cutoff: usize,
         shape_version: u64,
     ) -> Option<bool> {
         self.apply_metadata_update(shape_version, |state| {
-            state.cover_prefix_for_worker(worker, cutoff)
+            state.cover_prefix(&self.full, slot, cutoff)
         })
     }
 
     pub(super) fn promote_to_full_with_version(
         &self,
-        worker: WorkerWithDpRank,
+        slot: Slot,
         shape_version: u64,
     ) -> Option<bool> {
-        self.apply_metadata_update(shape_version, |state| state.promote_to_full(worker))
+        self.promote_full(slot, Some(shape_version))
     }
 
     pub(super) fn split_for_store_tail(
         &self,
-        worker: WorkerWithDpRank,
+        slot: Slot,
         split_pos: usize,
         tail_first_local: LocalBlockHash,
         tail_node: SharedNode,
@@ -503,8 +593,8 @@ impl Node {
     ) -> SplitStoreOutcome {
         self.apply_edge_shape_update(shape_version, |state, children| {
             let split = self.split_at_locked(state, split_pos);
-            state.promote_to_full(worker);
-            let _ = children.insert(tail_first_local, tail_node.clone());
+            state.promote_to_full(&self.full, slot);
+            children.insert(tail_first_local, tail_node.clone());
             (SplitStoreOutcome::Done { split, tail_node }, true)
         })
         .unwrap_or(SplitStoreOutcome::Stale)
@@ -512,7 +602,7 @@ impl Node {
 
     pub(super) fn try_extend_leaf_with_version(
         &self,
-        worker: WorkerWithDpRank,
+        slot: Slot,
         parent_hash: ExternalSequenceBlockHash,
         blocks: &[KvCacheStoredBlockData],
         shape_version: u64,
@@ -527,11 +617,12 @@ impl Node {
             }
 
             let old_len = state.edge.len();
-            if !state.tail_hash_is(parent_hash) || !state.covers_pos(worker, old_len - 1) {
+            if !state.tail_hash_is(parent_hash) || !state.covers_pos(&self.full, slot, old_len - 1)
+            {
                 return (false, false);
             }
 
-            state.append_blocks_to_leaf(worker, blocks);
+            state.append_blocks_to_leaf(&self.full, slot, blocks);
             (true, true)
         })
     }
@@ -592,109 +683,94 @@ impl Node {
         }
     }
 
-    fn split_at_locked(&self, state: &mut NodeState, pos: usize) -> SplitLookupData {
-        debug_assert!(
-            pos > 0 && pos < state.edge.len(),
-            "split position {pos} out of range for edge length {}",
-            state.edge.len()
-        );
-
-        let suffix_edge = state.edge.split_off(pos);
-        let suffix_first_local = suffix_edge[0].0;
-        let prefix_len = pos;
-        let suffix_edge_index = NodeState::edge_index_for(&suffix_edge);
-
-        for &(_, hash) in &suffix_edge {
-            state.edge_index.remove(&hash);
-        }
-
-        let mut suffix_full =
-            FxHashSet::with_capacity_and_hasher(state.full_edge_workers.len(), FxBuildHasher);
-        let mut suffix_cutoffs =
-            FxHashMap::with_capacity_and_hasher(state.worker_cutoffs.len(), FxBuildHasher);
-        let mut to_promote: Vec<WorkerWithDpRank> = Vec::new();
-
-        for &worker in &state.full_edge_workers {
-            suffix_full.insert(worker);
-        }
-        for (&worker, &cutoff) in &state.worker_cutoffs {
-            if cutoff >= prefix_len {
-                to_promote.push(worker);
-                let suffix_cutoff = cutoff - prefix_len;
-                if suffix_cutoff > 0 {
-                    suffix_cutoffs.insert(worker, suffix_cutoff);
-                }
-            }
-        }
-        for worker in &to_promote {
-            state.worker_cutoffs.remove(worker);
-            state.full_edge_workers.insert(*worker);
-        }
-
+    fn split_at_locked(&self, state: &mut CrtcNodeState, pos: usize) -> SplitLookupData {
+        // The suffix inherits this node's full coverage as it was before the split
+        // promotes partial ranks that reach the split point.
+        let suffix_full = FullCoverage::from_set(&self.full.snapshot());
+        let suffix_state = state.split_off_suffix(&self.full, pos);
+        let suffix_first_local = suffix_state.edge[0].0;
         let suffix_children = self.children.transfer_for_split();
 
-        let suffix = Arc::new(Node::from_state_and_node_children(
-            NodeState {
-                edge: suffix_edge,
-                edge_index: suffix_edge_index,
-                worker_cutoffs: suffix_cutoffs,
-                full_edge_workers: suffix_full,
-            },
-            suffix_children,
-        ));
-        let _ = self.children.insert(suffix_first_local, suffix.clone());
+        let suffix = Arc::new(Node::from_parts(suffix_state, suffix_full, suffix_children));
+        self.children.insert(suffix_first_local, suffix.clone());
         self.internal.store(true, Ordering::Release);
 
         SplitLookupData { suffix }
     }
 
-    pub(super) fn remove_worker_for_hashes(
+    /// Removes `slot` from the leading run of `hashes` found in this edge, under one
+    /// exclusive shape gate. Returns how many hashes the run consumed and the newly uncovered
+    /// hashes, or `None` if the first hash is no longer in this edge.
+    pub(super) fn remove_worker_for_leading_hashes(
         &self,
-        worker: WorkerWithDpRank,
-        block_hashes: &[ExternalSequenceBlockHash],
-    ) -> Option<RemoveBatchOutcome> {
+        slot: Slot,
+        hashes: &[ExternalSequenceBlockHash],
+    ) -> Option<(usize, Vec<ExternalSequenceBlockHash>)> {
+        // The exclusive gate keeps every other writer off this node, so the run is read
+        // alongside readers, and only a cutoff change upgrades to the write lock.
         let _gate = self.shape_gate.write();
-        let mut state = self.state.write();
-        let mut min_match = None;
-        let mut unmatched_hashes = Vec::new();
+        let state = self.state.upgradable_read();
+        let mut min_match: Option<(usize, ExternalSequenceBlockHash)> = None;
+        let mut consumed = 0;
 
-        for &hash in block_hashes {
-            match state.edge_index.get(&hash).copied() {
-                Some(pos) => {
-                    if min_match.is_none_or(|(min_pos, _)| pos < min_pos) {
-                        min_match = Some((pos, hash));
-                    }
-                }
-                None => unmatched_hashes.push(hash),
+        for &hash in hashes {
+            let Some(&pos) = state.edge_index.get(&hash) else {
+                break;
+            };
+            if min_match.is_none_or(|(min_pos, _)| pos < min_pos) {
+                min_match = Some((pos, hash));
             }
+            consumed += 1;
         }
 
         let (pos, block_hash) = min_match?;
-        let outcome = state.remove_worker_at_pos(worker, pos, block_hash);
-        let should_clear_children = state.full_edge_workers.is_empty();
-        drop(state);
+        let outcome = if pos >= state.current_cutoff(&self.full, slot) {
+            RemoveOutcome {
+                stale_hashes: vec![block_hash],
+            }
+        } else if pos == 0 && self.full.contains(slot) {
+            state.drop_full_slot(&self.full, slot)
+        } else {
+            StateWriteGuard {
+                has_cutoffs: &self.has_cutoffs,
+                state: RwLockUpgradableReadGuard::upgrade(state),
+            }
+            .remove_worker_at_pos(&self.full, slot, pos, block_hash)
+        };
+        let should_clear_children = self.full.is_empty();
         self.clear_children_if_unreachable(should_clear_children);
-        Some(RemoveBatchOutcome {
-            stale_hashes: outcome.stale_hashes,
-            unmatched_hashes,
-        })
+        Some((consumed, outcome.stale_hashes))
     }
 
     #[cfg_attr(feature = "profile", inline(never))]
-    pub(super) fn find_match_step<S: HashSequence>(
-        &self,
-        mut input: FindStepInput<'_, S>,
-    ) -> FindStepOutcome {
+    pub(super) fn find_match_step<'g, S: HashSequence>(
+        &'g self,
+        input: FindStepInput<'_, S>,
+        guard: &'g Guard,
+    ) -> FindStepOutcome<'g> {
+        let FindStepInput {
+            sequence,
+            seq_pos,
+            first_node,
+            prev_depth,
+            prev_edge_last_hash,
+            table,
+            active,
+            scores,
+            mut last_matched_hashes,
+            kv_transfer_chain,
+        } = input;
+
         // NOTE: This read intentionally does not take shape_gate. A concurrent
         // split can make the edge snapshot and child lookup come from adjacent
         // tree shapes; find_matches tolerates that brief best-effort race.
         let state = self.state.read();
         let edge_len = state.edge.len();
-        let walk_len = edge_len.min(input.sequence.len() - input.seq_pos);
+        let walk_len = edge_len.min(sequence.len() - seq_pos);
 
         let mut edge_match_len = 1;
         for i in 1..walk_len {
-            if state.edge[i].0 != input.sequence.at(input.seq_pos + i) {
+            if state.edge[i].0 != sequence.at(seq_pos + i) {
                 break;
             }
             edge_match_len += 1;
@@ -705,7 +781,7 @@ impl Node {
             state.edge[depth - 1].1
         };
 
-        if let Some(block_hashes) = input.kv_transfer_chain.as_deref_mut() {
+        if let Some(block_hashes) = kv_transfer_chain {
             block_hashes.extend(
                 state
                     .edge
@@ -715,80 +791,61 @@ impl Node {
             );
         }
 
-        if input.first_node {
+        if first_node {
+            active.load(&self.full);
             // Every scored worker is covered by the first node, so its coverage bounds
             // the result size; reserving avoids repeated rehash growth per query.
-            let scored_bound = state.full_edge_workers.len() + state.worker_cutoffs.len();
-            input.scores.scores.reserve(scored_bound);
-            if let Some(last_matched_hashes) = input.last_matched_hashes.as_deref_mut() {
+            let scored_bound = active.count() + state.cutoffs.len();
+            scores.scores.reserve(scored_bound);
+            if let Some(last_matched_hashes) = last_matched_hashes.as_deref_mut() {
                 last_matched_hashes.reserve(scored_bound);
             }
-            *input.active = state.full_edge_workers.clone();
-            for (&worker, &cutoff) in &state.worker_cutoffs {
+            for (slot, cutoff) in state.cutoffs.iter() {
                 let contribution = cutoff.min(edge_match_len);
-                if contribution > 0 {
-                    input.scores.scores.insert(worker, contribution as u32);
-                    record_last_matched_hash(
-                        &mut input.last_matched_hashes,
-                        worker,
-                        edge_hash_at(contribution),
-                    );
+                if contribution == 0 {
+                    continue;
                 }
+                let Some(worker) = table.owner(slot) else {
+                    continue;
+                };
+                scores.scores.insert(worker, contribution as u32);
+                record_last_matched_hash(
+                    &mut last_matched_hashes,
+                    worker,
+                    edge_hash_at(contribution),
+                );
             }
         } else {
-            let has_partial = !state.worker_cutoffs.is_empty();
-            if has_partial {
-                input.active.retain(|worker| {
-                    if state.full_edge_workers.contains(worker) {
-                        true
-                    } else if let Some(&cutoff) = state.worker_cutoffs.get(worker) {
-                        let effective = cutoff.min(edge_match_len);
-                        input
-                            .scores
-                            .scores
-                            .insert(*worker, input.prev_depth + effective as u32);
-                        if effective > 0 {
-                            record_last_matched_hash(
-                                &mut input.last_matched_hashes,
-                                *worker,
-                                edge_hash_at(effective),
-                            );
-                        } else if let Some(hash) = input.prev_edge_last_hash {
-                            record_last_matched_hash(&mut input.last_matched_hashes, *worker, hash);
-                        }
-                        false
-                    } else {
-                        input.scores.scores.insert(*worker, input.prev_depth);
-                        if let Some(hash) = input.prev_edge_last_hash {
-                            record_last_matched_hash(&mut input.last_matched_hashes, *worker, hash);
-                        }
-                        false
-                    }
-                });
-            } else if state.full_edge_workers.len() != input.active_count {
-                // Equal sizes are treated as equal sets, skipping the intersection. This
-                // accepts an overcount after head-first eviction; see README "Equal-size skip".
-                input.active.retain(|worker| {
-                    if state.full_edge_workers.contains(worker) {
-                        true
-                    } else {
-                        input.scores.scores.insert(*worker, input.prev_depth);
-                        if let Some(hash) = input.prev_edge_last_hash {
-                            record_last_matched_hash(&mut input.last_matched_hashes, *worker, hash);
-                        }
-                        false
-                    }
-                });
-            }
+            // Ranks that do not cover this whole edge stop here, scored by their cutoff,
+            // if any, past the previous depth.
+            active.intersect(&self.full, |slot| {
+                let Some(worker) = table.owner(slot) else {
+                    return;
+                };
+                let effective = state
+                    .cutoffs
+                    .get(slot)
+                    .map_or(0, |cutoff| cutoff.min(edge_match_len));
+                scores.scores.insert(worker, prev_depth + effective as u32);
+                if effective > 0 {
+                    record_last_matched_hash(
+                        &mut last_matched_hashes,
+                        worker,
+                        edge_hash_at(effective),
+                    );
+                } else if let Some(hash) = prev_edge_last_hash {
+                    record_last_matched_hash(&mut last_matched_hashes, worker, hash);
+                }
+            });
         }
 
-        let active_count = input.active.len();
+        let active_count = active.count();
         let next_child = if edge_match_len == edge_len
             && active_count > 0
-            && input.seq_pos + edge_match_len < input.sequence.len()
+            && seq_pos + edge_match_len < sequence.len()
         {
             self.children
-                .get(&input.sequence.at(input.seq_pos + edge_match_len))
+                .get_ref(&sequence.at(seq_pos + edge_match_len), guard)
         } else {
             None
         };
@@ -804,6 +861,8 @@ impl Node {
 
     pub(super) fn remove_child_if_stale_leaf(&self, key: LocalBlockHash, child: &SharedNode) {
         let _parent_gate = self.shape_gate.write();
+        // Pin after the gate so a parked wait does not hold back epoch reclamation.
+        let _guard = crossbeam_epoch::pin();
         let still_attached = self
             .children
             .get(&key)
@@ -815,15 +874,48 @@ impl Node {
         let Some(_child_gate) = child.shape_gate.try_write() else {
             return;
         };
-        if child.state.read().has_any_workers() || !child.children.is_empty() {
+        if child.has_any_workers() || !child.children.is_empty() {
             return;
         }
-        if Arc::strong_count(child) != 2 {
+        // The parent map and the caller's candidate must hold the only live references;
+        // any other holder is a writer that may still cover or extend this node. Readers
+        // borrow children without a reference, so this can unlink a leaf a read is
+        // standing on. That read sees no workers here and so cannot overcount, and the
+        // epoch keeps the node allocated until it unpins.
+        if Self::live_strong_count(child) != Some(2) {
             return;
         }
 
-        let _ = self.children.remove(&key);
+        self.children.remove(&key);
         self.shape_version.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// The state write lock. Releasing it republishes whether any cutoffs remain.
+struct StateWriteGuard<'a> {
+    has_cutoffs: &'a AtomicBool,
+    state: RwLockWriteGuard<'a, CrtcNodeState>,
+}
+
+impl std::ops::Deref for StateWriteGuard<'_> {
+    type Target = CrtcNodeState;
+
+    fn deref(&self) -> &CrtcNodeState {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for StateWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut CrtcNodeState {
+        &mut self.state
+    }
+}
+
+impl Drop for StateWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Runs before the lock is released, so the flag never lags a reader of the state.
+        self.has_cutoffs
+            .store(!self.state.cutoffs.is_empty(), Ordering::Release);
     }
 }
 
